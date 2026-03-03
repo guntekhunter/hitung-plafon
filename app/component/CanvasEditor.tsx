@@ -1,20 +1,18 @@
 'use client';
 import React, { useMemo } from 'react';
 import { Stage, Layer, Line, Circle, Text, Group, Rect } from 'react-konva';
+import Konva from 'konva';
 import { usePlafonStore, SCALE, PANEL_WIDTH_METERS } from '@/app/function/usePlafonStore';
 
 const CanvasEditor = () => {
     const {
-        points, isClosed, addPoint, updatePoint, getOffsetPoints,
-        ceilingType, edgeOffset, secondEdgeOffset,
-        primaryColor, secondaryColor,
-        primaryTexture, secondaryTexture,
-        direction,
-        updateEdgeLength // Add this
+        shapes, activeShapeId, addPoint, updatePoint, updateEdgeLength, getOffsetPoints, setActiveShape
     } = usePlafonStore();
 
-    // Interaction State
-    const [editingIndex, setEditingIndex] = React.useState<number | null>(null);
+    // Interaction & View Settings
+    const [stageScale, setStageScale] = React.useState(1);
+    const [stagePos, setStagePos] = React.useState({ x: 0, y: 0 });
+    const [editingIndex, setEditingIndex] = React.useState<{ shapeId: string, index: number } | null>(null);
     const [inputValue, setInputValue] = React.useState<string>("");
     const inputRef = React.useRef<HTMLInputElement>(null);
 
@@ -24,18 +22,63 @@ const CanvasEditor = () => {
         }
     }, [editingIndex]);
 
-    const handleLabelClick = (index: number, currentLength: string) => {
-        // Prevent editing while dragging points or not closed
-        if (!isClosed) return;
-        setEditingIndex(index);
+    const SNAP_THRESHOLD = 15;
+
+    // Helper: Convert screen/stage click to world coordinates
+    const getPointerPosition = (stage: any) => {
+        const pos = stage.getPointerPosition();
+        if (!pos) return null;
+        return {
+            x: (pos.x - stage.x()) / stage.scaleX(),
+            y: (pos.y - stage.y()) / stage.scaleY()
+        };
+    };
+
+    // Helper: Snap to edges of OTHER shapes
+    const getSnappedToEdge = (x: number, y: number, currentShapeId: string) => {
+        let snapped = { x, y };
+        let minDistance = Infinity;
+
+        shapes.forEach(shape => {
+            if (shape.id === currentShapeId) return; // Don't snap to itself yet (internal snapping handled elsewhere)
+            if (shape.points.length < 2) return;
+
+            for (let i = 0; i < shape.points.length; i++) {
+                const p1 = shape.points[i];
+                const p2 = shape.points[(i + 1) % shape.points.length];
+                if (i === shape.points.length - 1 && !shape.isClosed) continue;
+
+                // Nearest point on segment logic
+                const atob = { x: p2.x - p1.x, y: p2.y - p1.y };
+                const atop = { x: x - p1.x, y: y - p1.y };
+                const lenSq = atob.x * atob.x + atob.y * atob.y;
+                let dot = lenSq === 0 ? 0 : (atop.x * atob.x + atop.y * atob.y) / lenSq;
+                dot = Math.max(0, Math.min(1, dot));
+                const nearest = { x: p1.x + atob.x * dot, y: p1.y + atob.y * dot };
+
+                const dist = Math.hypot(x - nearest.x, y - nearest.y);
+                if (dist < SNAP_THRESHOLD && dist < minDistance) {
+                    minDistance = dist;
+                    snapped = nearest;
+                }
+            }
+        });
+        return snapped;
+    };
+
+    const handleLabelClick = (shapeId: string, index: number, currentLength: string) => {
+        const shape = shapes.find(s => s.id === shapeId);
+        if (!shape || !shape.isClosed) return;
+        setEditingIndex({ shapeId, index });
         setInputValue(currentLength);
+        setActiveShape(shapeId);
     };
 
     const handleInputCommit = () => {
         if (editingIndex !== null) {
             const val = parseFloat(inputValue);
             if (!isNaN(val) && val > 0) {
-                updateEdgeLength(editingIndex, val);
+                updateEdgeLength(editingIndex.shapeId, editingIndex.index, val);
             }
             setEditingIndex(null);
         }
@@ -46,17 +89,32 @@ const CanvasEditor = () => {
         if (e.key === 'Escape') setEditingIndex(null);
     };
 
-    // const SCALE = 50; // Imported from store
-    const SNAP_THRESHOLD = 20; // Pixels to snap
+    const handleZoom = (e: any) => {
+        e.evt.preventDefault();
+        const stage = e.target.getStage();
+        const oldScale = stage.scaleX();
+        const pointer = stage.getPointerPosition();
 
-    // Helper hook to load image and dimensions
+        const mousePointTo = {
+            x: (pointer.x - stage.x()) / oldScale,
+            y: (pointer.y - stage.y()) / oldScale,
+        };
+
+        const newScale = e.evt.deltaY < 0 ? oldScale * 1.1 : oldScale / 1.1;
+        const clampedScale = Math.max(0.2, Math.min(5, newScale));
+
+        setStageScale(clampedScale);
+        setStagePos({
+            x: pointer.x - mousePointTo.x * clampedScale,
+            y: pointer.y - mousePointTo.y * clampedScale,
+        });
+    };
+
+    // texture handling (keeping existing logic)
     const useTexture = (fileName: string | null) => {
         const [texture, setTexture] = React.useState<{ img: HTMLImageElement, width: number, height: number } | null>(null);
         React.useEffect(() => {
-            if (!fileName) {
-                setTexture(null);
-                return;
-            }
+            if (!fileName) { setTexture(null); return; }
             const img = new window.Image();
             img.src = `/texture/${fileName}`;
             img.onload = () => setTexture({ img, width: img.naturalWidth, height: img.naturalHeight });
@@ -64,366 +122,251 @@ const CanvasEditor = () => {
         return texture;
     };
 
-    const primaryTexData = useTexture(primaryTexture);
-    const secondaryTexData = useTexture(secondaryTexture);
+    const firstRoom = shapes.find(s => s.type === 'room') || shapes[0];
+    const primaryTexData = useTexture(firstRoom?.primaryTexture);
+    const secondaryTexData = useTexture(firstRoom?.secondaryTexture);
+    const panelHeightPx = PANEL_WIDTH_METERS * SCALE;
+    const getTexScale = (tex: any) => tex ? (panelHeightPx / tex.height) : 1;
 
-    const panelHeightPx = PANEL_WIDTH_METERS * SCALE; // e.g., 0.2 * 50 = 10px tall
+    const handleStageMouseDown = (e: any) => {
+        if (e.evt.button === 1 || (e.evt.button === 0 && e.evt.shiftKey)) return; // Don't add point when panning
 
-    // Calculate scale to make the texture height match the panel height (20cm / 10px)
-    // Assuming image 'height' corresponds to the 20cm board width.
-    const getScale = (tex: { width: number, height: number } | null) => {
-        if (!tex) return { x: 1, y: 1 };
-        // The Scale Factor = Target Size (10px) / Image Native Size
-        // We assume the image represents a 20cm wide board.
-        // If image is square or vertical, we map its height to the panel height.
-        const s = panelHeightPx / tex.height;
-        return { x: s, y: s }; // Maintain aspect ratio
-    };
-
-    const primaryScale = getScale(primaryTexData);
-    const secondaryScale = getScale(secondaryTexData);
-
-    // Flatten points for Konva Line [x1, y1, x2, y2...]
-    const flattenedPoints = points.flatMap(p => [p.x, p.y]);
-
-
-
-    // 1. Calculate Bounding Box (to know where to generate planks)
-    const bounds = useMemo(() => {
-        if (points.length < 2) return { minX: 0, minY: 0, width: 0, height: 0 };
-        const xs = points.map(p => p.x);
-        const ys = points.map(p => p.y);
-        const minX = Math.min(...xs);
-        const minY = Math.min(...ys);
-        return {
-            minX, minY,
-            width: Math.max(...xs) - minX,
-            height: Math.max(...ys) - minY
-        };
-    }, [points]);
-
-    // 2. Define the Clipping Function based on the drawn polygon
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const clipFunc = React.useCallback((ctx: any) => {
-        if (points.length < 3 || !isClosed) return;
-        ctx.beginPath();
-        ctx.moveTo(points[0].x, points[0].y);
-        for (let i = 1; i < points.length; i++) {
-            ctx.lineTo(points[i].x, points[i].y);
-        }
-        ctx.closePath();
-    }, [points, isClosed]);
-
-    // 3. Generate the Planks (Ribbons) - TEXTURE ONLY
-    const renderedPlanks = useMemo(() => {
-        if (!isClosed || bounds.height === 0) return null;
-
-        const planks = [];
-
-        if (direction === 'horizontal') {
-            const numRows = Math.ceil(bounds.height / panelHeightPx);
-            for (let i = 0; i < numRows; i++) {
-                const yPos = bounds.minY + (i * panelHeightPx);
-                planks.push(
-                    <Rect
-                        key={`plank-h-${i}`}
-                        x={bounds.minX - 10}
-                        y={yPos}
-                        width={bounds.width + 20}
-                        height={panelHeightPx}
-                        fill="transparent"
-                        stroke="#cbd5e1"
-                        strokeWidth={0.5}
-                        opacity={0.3}
-                    />
-                );
-            }
-        } else {
-            // Vertical - Columns
-            const numCols = Math.ceil(bounds.width / panelHeightPx);
-            for (let i = 0; i < numCols; i++) {
-                const xPos = bounds.minX + (i * panelHeightPx);
-                planks.push(
-                    <Rect
-                        key={`plank-v-${i}`}
-                        x={xPos}
-                        y={bounds.minY - 10}
-                        width={panelHeightPx}
-                        height={bounds.height + 20}
-                        fill="transparent"
-                        stroke="#cbd5e1"
-                        strokeWidth={0.5}
-                        opacity={0.3}
-                    />
-                );
-            }
-        }
-        return planks;
-    }, [isClosed, bounds, panelHeightPx, direction]);
-
-    // Inner points calculation
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let innerPoints1: any[] = [];
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let innerPoints2: any[] = [];
-
-    if (isClosed) {
-        if (ceilingType === 'drop1' || ceilingType === 'drop2') {
-            innerPoints1 = getOffsetPoints(edgeOffset);
-        }
-        if (ceilingType === 'drop2') {
-            innerPoints2 = getOffsetPoints(edgeOffset + secondEdgeOffset);
-        }
-    }
-
-    const flattenedInnerPoints1 = innerPoints1.flatMap(p => [p.x, p.y]);
-    const flattenedInnerPoints2 = innerPoints2.flatMap(p => [p.x, p.y]);
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const handleStageClick = (e: any) => {
-        // Only add points if clicking on empty space and shape not closed
         const stage = e.target.getStage();
-        const pos = stage.getPointerPosition();
-        if (pos && !isClosed) {
-            addPoint(pos.x, pos.y);
+        const pos = getPointerPosition(stage);
+        if (pos) {
+            // Apply edge snapping to new point
+            const snapped = getSnappedToEdge(pos.x, pos.y, activeShapeId || "");
+            addPoint(snapped.x, snapped.y);
         }
     };
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const handleDragMove = (e: any, index: number) => {
+    const handleDragMove = (e: any, shapeId: string, index: number) => {
         let newX = e.target.x();
         let newY = e.target.y();
 
-        // Snapping Logic
-        const neighbors = [];
-        // Previous point
-        if (index > 0) neighbors.push(points[index - 1]);
-        else if (isClosed) neighbors.push(points[points.length - 1]);
+        const shape = shapes.find(s => s.id === shapeId);
+        if (!shape) return;
 
-        // Next point
-        if (index < points.length - 1) neighbors.push(points[index + 1]);
-        else if (isClosed) neighbors.push(points[0]);
+        // 1. Internal Point Snapping
+        const neighbors = [];
+        if (index > 0) neighbors.push(shape.points[index - 1]);
+        else if (shape.isClosed) neighbors.push(shape.points[shape.points.length - 1]);
+        if (index < shape.points.length - 1) neighbors.push(shape.points[index + 1]);
+        else if (shape.isClosed) neighbors.push(shape.points[0]);
 
         neighbors.forEach(neighbor => {
-            if (Math.abs(newX - neighbor.x) < SNAP_THRESHOLD) newX = neighbor.x;
-            if (Math.abs(newY - neighbor.y) < SNAP_THRESHOLD) newY = neighbor.y;
+            if (Math.abs(newX - neighbor.x) < 10) newX = neighbor.x;
+            if (Math.abs(newY - neighbor.y) < 10) newY = neighbor.y;
         });
 
-        // Update position immediately for smooth feedback
+        // 2. Edge Snapping (to other shapes)
+        const snapped = getSnappedToEdge(newX, newY, shapeId);
+        newX = snapped.x;
+        newY = snapped.y;
+
         e.target.x(newX);
         e.target.y(newY);
+        updatePoint(shapeId, index, newX, newY);
+    };
 
-        updatePoint(index, newX, newY);
+    // Helper: Render Panel Direction Lines (Decorative)
+    const renderPanelLines = (pts: any[], direction: 'horizontal' | 'vertical', isActive: boolean) => {
+        if (pts.length < 3) return null;
+        const xs = pts.map(p => p.x);
+        const ys = pts.map(p => p.y);
+        const minX = Math.min(...xs);
+        const maxX = Math.max(...xs);
+        const minY = Math.min(...ys);
+        const maxY = Math.max(...ys);
+
+        const step = PANEL_WIDTH_METERS * SCALE;
+        const lines = [];
+
+        if (direction === 'horizontal') {
+            for (let y = minY + step; y < maxY; y += step) {
+                lines.push(<Line key={`h-${y}`} points={[minX, y, maxX, y]} stroke="#cbd5e1" strokeWidth={0.5 / stageScale} dash={[5, 5]} />);
+            }
+        } else {
+            for (let x = minX + step; x < maxX; x += step) {
+                lines.push(<Line key={`v-${x}`} points={[x, minY, x, maxY]} stroke="#cbd5e1" strokeWidth={0.5 / stageScale} dash={[5, 5]} />);
+            }
+        }
+
+        return (
+            <Group clipFunc={(ctx) => {
+                ctx.beginPath();
+                ctx.moveTo(pts[0].x, pts[0].y);
+                pts.slice(1).forEach(p => ctx.lineTo(p.x, p.y));
+                ctx.closePath();
+            }}>
+                {lines}
+            </Group>
+        );
     };
 
     return (
-        <div className="relative border-2 border-slate-200 rounded-lg overflow-hidden bg-white shadow-inner">
+        <div className="relative border-2 border-slate-200 rounded-xl overflow-hidden bg-slate-100 shadow-inner group">
+            {/* Legend / Tooltip */}
+            <div className="absolute top-4 left-4 z-10 space-y-2 pointer-events-none">
+                <div className="bg-white/90 backdrop-blur px-3 py-1.5 rounded-lg border border-slate-200 text-xs shadow-sm flex items-center gap-3">
+                    <span className="flex items-center gap-1"><kbd className="px-1.5 py-0.5 bg-slate-100 border rounded text-[10px]">Scroll</kbd> Zoom</span>
+                    <span className="flex items-center gap-1"><kbd className="px-1.5 py-0.5 bg-slate-100 border rounded text-[10px]">Right Click</kbd> Pan</span>
+                </div>
+            </div>
+
             <Stage
                 width={800}
                 height={600}
-                onMouseDown={handleStageClick}
-                className="cursor-crosshair bg-grid-pattern" // Custom class for grid bg
+                scaleX={stageScale}
+                scaleY={stageScale}
+                x={stagePos.x}
+                y={stagePos.y}
+                onWheel={handleZoom}
+                onMouseDown={handleStageMouseDown}
+                draggable={true}
+                onDragEnd={(e: any) => {
+                    if (e.target === e.target.getStage()) {
+                        setStagePos({ x: e.target.x(), y: e.target.y() });
+                    }
+                }}
+                // Custom pan with middle mouse or right click
+                onContentContextMenu={(e: any) => e.evt.preventDefault()}
+                className="bg-grid-pattern cursor-move"
             >
                 <Layer>
-                    {!isClosed && (
-                        <Text text="Click to place corners. Click start point to close." x={20} y={20} fill="gray" />
+                    {shapes.length === 0 && (
+                        <Text text="Klik untuk mulai menggambar sudut..." x={20} y={20} fill="#94a3b8" fontSize={14} />
                     )}
 
-                    {/* VISUALIZATION - STACKED LAYERS */}
-                    {isClosed && (
-                        <Group>
-                            {/* Layer 1: Base / Outer - Primary */}
-                            <Line
-                                points={flattenedPoints}
-                                fill={!(primaryTexData?.img) ? primaryColor : undefined}
-                                fillPatternImage={primaryTexData?.img || undefined}
-                                fillPatternRepeat="repeat"
-                                fillPatternScale={primaryScale}
-                                fillPatternRotation={direction === 'horizontal' ? 90 : 0}
-                                fillPatternY={bounds.minY}
-                                closed={true}
-                                strokeEnabled={false}
-                            />
+                    {shapes.map(shape => {
+                        const flattenedPoints = shape.points.flatMap(p => [p.x, p.y]);
+                        const isActive = shape.id === activeShapeId;
+                        const pScale = getTexScale(primaryTexData);
+                        const sScale = getTexScale(secondaryTexData);
 
-                            {/* Layer 2: Drop 1 - Secondary */}
-                            {flattenedInnerPoints1.length > 0 && (
-                                <Line
-                                    points={flattenedInnerPoints1}
-                                    fill={!(secondaryTexData?.img) ? secondaryColor : undefined}
-                                    fillPatternImage={secondaryTexData?.img || undefined}
-                                    fillPatternRepeat="repeat"
-                                    fillPatternScale={secondaryScale}
-                                    fillPatternRotation={direction === 'horizontal' ? 90 : 0}
-                                    fillPatternY={bounds.minY}
-                                    closed={true}
-                                    strokeEnabled={false}
-                                />
-                            )}
+                        let offset1: any[] = [];
+                        let offset2: any[] = [];
+                        if (shape.isClosed && shape.type === 'room') {
+                            if (shape.ceilingType !== 'flat') offset1 = getOffsetPoints(shape.id, shape.edgeOffset);
+                            if (shape.ceilingType === 'drop2') offset2 = getOffsetPoints(shape.id, shape.edgeOffset + shape.secondEdgeOffset);
+                        }
 
-                            {/* Layer 3: Drop 2 - Primary */}
-                            {flattenedInnerPoints2.length > 0 && (
-                                <Line
-                                    points={flattenedInnerPoints2}
-                                    fill={!(primaryTexData?.img) ? primaryColor : undefined}
-                                    fillPatternImage={primaryTexData?.img || undefined}
-                                    fillPatternRepeat="repeat"
-                                    fillPatternScale={primaryScale}
-                                    fillPatternRotation={direction === 'horizontal' ? 90 : 0}
-                                    fillPatternY={bounds.minY}
-                                    closed={true}
-                                    strokeEnabled={false}
-                                />
-                            )}
-                        </Group>
-                    )}
-
-                    {/* PANEL TEXTURE OVERLAY (Clipped to Main Shape) */}
-                    {isClosed && (
-                        <Group clipFunc={clipFunc}>
-                            {renderedPlanks}
-                        </Group>
-                    )}
-
-                    {/* OUTLINES / STROKES (Drawn on top for crispness) */}
-                    <Line
-                        points={flattenedPoints}
-                        stroke="#0ea5e9" // Sky blue
-                        strokeWidth={isClosed ? 3 : 2}
-                        closed={isClosed}
-                        lineCap="round"
-                        lineJoin="round"
-                    />
-
-                    {/* Drop 1 Outline (Amber) */}
-                    {isClosed && flattenedInnerPoints1.length > 0 && (
-                        <Line
-                            points={flattenedInnerPoints1}
-                            stroke="#f59e0b"
-                            strokeWidth={2}
-                            dash={[10, 5]}
-                            closed={true}
-                        />
-                    )}
-
-                    {/* Drop 2 Outline (Orange) */}
-                    {isClosed && flattenedInnerPoints2.length > 0 && (
-                        <Line
-                            points={flattenedInnerPoints2}
-                            stroke="#ea580c"
-                            strokeWidth={2}
-                            dash={[5, 5]}
-                            closed={true}
-                        />
-                    )}
-
-                    {/* Length Labels */}
-                    {points.map((point, i) => {
-                        if (i === points.length - 1 && !isClosed) return null;
-
-                        const nextPoint = points[(i + 1) % points.length];
-                        const midX = (point.x + nextPoint.x) / 2;
-                        const midY = (point.y + nextPoint.y) / 2;
-                        const lengthPx = Math.hypot(nextPoint.x - point.x, nextPoint.y - point.y);
-                        const lengthM = (lengthPx / SCALE).toFixed(2);
-
-                        // If editing this index, don't show text, show input overlay (but input is DOM, so maybe show faint text or nothing)
-                        const isEditing = editingIndex === i;
+                        const minY = Math.min(...shape.points.map(p => p.y));
 
                         return (
-                            <React.Fragment key={`label-${i}`}>
-                                {!isEditing && (
-                                    <Group
-                                        onClick={() => handleLabelClick(i, lengthM)}
-                                        onTap={() => handleLabelClick(i, lengthM)}
-                                        onMouseEnter={() => {
-                                            const container = document.body;
-                                            if (container) container.style.cursor = "text";
-                                        }}
-                                        onMouseLeave={() => {
-                                            const container = document.body;
-                                            if (container) container.style.cursor = "default";
-                                        }}
-                                    >
-                                        {/* Background for easier clicking */}
-                                        <Rect
-                                            x={midX - 25}
-                                            y={midY - 12}
-                                            width={50}
-                                            height={24}
-                                            fill="rgba(255, 255, 255, 0.8)"
-                                            cornerRadius={4}
-                                            stroke={isClosed ? "#cbd5e1" : "transparent"} // Show hint it's interactive
-                                            strokeWidth={1}
+                            <Group key={shape.id} onClick={() => setActiveShape(shape.id)}>
+                                {shape.isClosed && (
+                                    <Group>
+                                        <Line
+                                            points={flattenedPoints}
+                                            fill={!(primaryTexData?.img) ? shape.primaryColor : undefined}
+                                            fillPatternImage={primaryTexData?.img || undefined}
+                                            fillPatternScale={{ x: pScale, y: pScale }}
+                                            fillPatternRotation={shape.direction === 'horizontal' ? 90 : 0}
+                                            fillPatternY={minY}
+                                            closed={true}
+                                            opacity={isActive ? 1 : 0.6}
                                         />
-                                        <Text
-                                            x={midX}
-                                            y={midY}
-                                            text={`${lengthM}m`}
-                                            fontSize={12}
-                                            fill="#0f172a"
-                                            align="center"
-                                            verticalAlign="middle"
-                                            offsetX={20}
-                                            offsetY={6}
-                                            fontStyle="bold"
-                                        />
+                                        {/* Visualization of Panel Direction */}
+                                        {renderPanelLines(shape.points, shape.direction, isActive)}
+
+                                        {offset1.length > 0 && (
+                                            <>
+                                                <Line
+                                                    points={offset1.flatMap(p => [p.x, p.y])}
+                                                    fill={!(secondaryTexData?.img) ? shape.secondaryColor : undefined}
+                                                    fillPatternImage={secondaryTexData?.img || undefined}
+                                                    fillPatternScale={{ x: sScale, y: sScale }}
+                                                    fillPatternRotation={shape.direction === 'horizontal' ? 90 : 0}
+                                                    fillPatternY={minY}
+                                                    closed={true}
+                                                />
+                                                {renderPanelLines(offset1, shape.direction, isActive)}
+                                            </>
+                                        )}
+                                        {offset2.length > 0 && (
+                                            <>
+                                                <Line
+                                                    points={offset2.flatMap(p => [p.x, p.y])}
+                                                    fill={!(primaryTexData?.img) ? shape.primaryColor : undefined}
+                                                    fillPatternImage={primaryTexData?.img || undefined}
+                                                    fillPatternScale={{ x: pScale, y: pScale }}
+                                                    fillPatternRotation={shape.direction === 'horizontal' ? 90 : 0}
+                                                    fillPatternY={minY}
+                                                    closed={true}
+                                                />
+                                                {renderPanelLines(offset2, shape.direction, isActive)}
+                                            </>
+                                        )}
                                     </Group>
                                 )}
-                            </React.Fragment>
+
+                                <Line
+                                    points={flattenedPoints}
+                                    stroke={isActive ? "#0ea5e9" : "#94a3b8"}
+                                    strokeWidth={isActive ? 3 / stageScale : 2 / stageScale}
+                                    closed={shape.isClosed}
+                                />
+
+                                {/* Labels */}
+                                {shape.points.map((point, i) => {
+                                    if (i === shape.points.length - 1 && !shape.isClosed) return null;
+                                    const nextPoint = shape.points[(i + 1) % shape.points.length];
+                                    const midX = (point.x + nextPoint.x) / 2;
+                                    const midY = (point.y + nextPoint.y) / 2;
+                                    const lengthM = (Math.hypot(nextPoint.x - point.x, nextPoint.y - point.y) / SCALE).toFixed(2);
+                                    if (parseFloat(lengthM) < 0.1) return null;
+
+                                    return (
+                                        <Group key={`lbl-${shape.id}-${i}`} onClick={() => handleLabelClick(shape.id, i, lengthM)}>
+                                            <Rect x={midX - 18 / stageScale} y={midY - 8 / stageScale} width={36 / stageScale} height={16 / stageScale} fill="white" stroke="#e2e8f0" strokeWidth={1 / stageScale} cornerRadius={2 / stageScale} />
+                                            <Text x={midX - 18 / stageScale} y={midY - 4 / stageScale} width={36 / stageScale} text={lengthM} fontSize={9 / stageScale} align="center" fontStyle="bold" fill="#64748b" />
+                                        </Group>
+                                    );
+                                })}
+
+                                {/* Points */}
+                                {shape.points.map((p, i) => (
+                                    <Circle
+                                        key={`pt-${shape.id}-${i}`}
+                                        x={p.x} y={p.y}
+                                        radius={(isActive ? 5 : 3) / stageScale}
+                                        fill="white" stroke={isActive ? "#0ea5e9" : "#cbd5e1"} strokeWidth={1 / stageScale}
+                                        draggable={isActive}
+                                        onDragMove={(e) => handleDragMove(e, shape.id, i)}
+                                    />
+                                ))}
+                            </Group>
                         );
                     })}
-
-                    {/* Drag Handles (Corners) */}
-                    {points.map((point, i) => (
-                        <Circle
-                            key={i}
-                            x={point.x}
-                            y={point.y}
-                            radius={6}
-                            fill="white"
-                            stroke="#0284c7"
-                            strokeWidth={2}
-                            draggable
-                            onDragMove={(e) => handleDragMove(e, i)}
-                            onMouseEnter={e => {
-                                const container = e.target.getStage()?.container();
-                                if (container) container.style.cursor = "move";
-                            }}
-                            onMouseLeave={e => {
-                                const container = e.target.getStage()?.container();
-                                if (container) container.style.cursor = "default";
-                            }}
-                        />
-                    ))}
                 </Layer>
             </Stage>
 
-            {/* DOM Overlay for Input */}
-            {editingIndex !== null && points.length > editingIndex && (
-                (() => {
-                    const p1 = points[editingIndex];
-                    const p2 = points[(editingIndex + 1) % points.length];
-                    const midX = (p1.x + p2.x) / 2;
-                    const midY = (p1.y + p2.y) / 2;
+            {/* DOM Overlay Input - Position must be manually calculated based on Stage Transformation */}
+            {editingIndex !== null && (() => {
+                const shape = shapes.find(s => s.id === editingIndex.shapeId);
+                if (!shape) return null;
+                const p1 = shape.points[editingIndex.index];
+                const p2 = shape.points[(editingIndex.index + 1) % shape.points.length];
+                const worldMidX = (p1.x + p2.x) / 2;
+                const worldMidY = (p1.y + p2.y) / 2;
 
-                    return (
-                        <input
-                            ref={inputRef}
-                            type="number"
-                            step="0.01"
-                            value={inputValue}
-                            onChange={(e) => setInputValue(e.target.value)}
-                            onBlur={handleInputCommit}
-                            onKeyDown={handleKeyDown}
-                            className="absolute z-10 w-20 px-1 py-0.5 text-sm font-bold text-center border border-sky-500 rounded shadow-md outline-none"
-                            style={{
-                                left: midX - 40 + 'px', // half width offset
-                                top: midY - 12 + 'px',  // half height offset
-                            }}
-                        />
-                    );
-                })()
-            )}
+                // Screen coordinates
+                const screenX = worldMidX * stageScale + stagePos.x;
+                const screenY = worldMidY * stageScale + stagePos.y;
+
+                return (
+                    <input
+                        ref={inputRef}
+                        type="number" step="0.01" value={inputValue}
+                        onChange={(e) => setInputValue(e.target.value)}
+                        onBlur={handleInputCommit}
+                        onKeyDown={handleKeyDown}
+                        className="absolute z-10 w-16 px-1 py-0.5 text-xs font-bold text-center border-2 border-sky-500 rounded bg-white shadow-xl outline-none"
+                        style={{ left: screenX - 32 + 'px', top: screenY - 12 + 'px' }}
+                    />
+                );
+            })()}
         </div>
     );
 };
